@@ -31,9 +31,18 @@ from services.ollama_service import (
 router = APIRouter()
 
 
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
 class ChatRequest(BaseModel):
     question: str
+    document_id: int
 
+
+# ============================================================
+# PATHS
+# ============================================================
 
 BASE_DIR = os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +59,13 @@ os.makedirs(
 )
 
 
+# ============================================================
+# STATUS
+# ============================================================
+
 @router.get("/status")
 def get_status():
+
     return {
         "project": "AISoC",
         "status": "running",
@@ -59,10 +73,15 @@ def get_status():
     }
 
 
+# ============================================================
+# DATABASE STATUS
+# ============================================================
+
 @router.get("/database-status")
 def database_status(
     db: Session = Depends(get_db)
 ):
+
     result = db.execute(
         text("SELECT current_database()")
     )
@@ -75,12 +94,18 @@ def database_status(
     }
 
 
+# ============================================================
+# UPLOAD DOCUMENT
+# ============================================================
+
 @router.post("/documents/upload")
 def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
+
     if not file.filename:
+
         raise HTTPException(
             status_code=400,
             detail="Filename is required"
@@ -91,7 +116,11 @@ def upload_document(
         file.filename
     )
 
-    with open(file_path, "wb") as buffer:
+    with open(
+        file_path,
+        "wb"
+    ) as buffer:
+
         shutil.copyfileobj(
             file.file,
             buffer
@@ -111,8 +140,14 @@ def upload_document(
 
     indexed_chunks = 0
 
+    # --------------------------------------------------------
+    # INDEX PDF
+    # --------------------------------------------------------
+
     if file.filename.lower().endswith(".pdf"):
+
         try:
+
             indexed_chunks = index_document(
                 document.id,
                 document.filename,
@@ -124,7 +159,9 @@ def upload_document(
             db.commit()
 
         except Exception as e:
+
             document.status = "uploaded"
+
             db.commit()
 
             print(
@@ -141,10 +178,15 @@ def upload_document(
     }
 
 
+# ============================================================
+# GET ALL DOCUMENTS
+# ============================================================
+
 @router.get("/documents")
 def get_documents(
     db: Session = Depends(get_db)
 ):
+
     documents = db.query(
         Document
     ).order_by(
@@ -164,11 +206,16 @@ def get_documents(
     ]
 
 
+# ============================================================
+# GET SINGLE DOCUMENT
+# ============================================================
+
 @router.get("/documents/{document_id}")
 def get_document(
     document_id: int,
     db: Session = Depends(get_db)
 ):
+
     document = db.query(
         Document
     ).filter(
@@ -176,6 +223,7 @@ def get_document(
     ).first()
 
     if not document:
+
         raise HTTPException(
             status_code=404,
             detail="Document not found"
@@ -191,11 +239,16 @@ def get_document(
     }
 
 
+# ============================================================
+# DELETE DOCUMENT
+# ============================================================
+
 @router.delete("/documents/{document_id}")
 def delete_document(
     document_id: int,
     db: Session = Depends(get_db)
 ):
+
     document = db.query(
         Document
     ).filter(
@@ -203,17 +256,31 @@ def delete_document(
     ).first()
 
     if not document:
+
         raise HTTPException(
             status_code=404,
             detail="Document not found"
         )
 
-    if document.file_path and os.path.exists(
+    # --------------------------------------------------------
+    # DELETE PHYSICAL FILE
+    # --------------------------------------------------------
+
+    if (
         document.file_path
+        and os.path.exists(document.file_path)
     ):
-        os.remove(document.file_path)
+
+        os.remove(
+            document.file_path
+        )
+
+    # --------------------------------------------------------
+    # DELETE DATABASE RECORD
+    # --------------------------------------------------------
 
     db.delete(document)
+
     db.commit()
 
     return {
@@ -222,42 +289,137 @@ def delete_document(
     }
 
 
+# ============================================================
+# CHAT
+# ============================================================
+
 @router.post("/chat")
 def chat(
-    request: ChatRequest
+    request: ChatRequest,
+    db: Session = Depends(get_db)
 ):
-    question = request.question
 
-    if not question.strip():
+    question = request.question.strip()
+
+    document_id = request.document_id
+
+    # --------------------------------------------------------
+    # VALIDATE QUESTION
+    # --------------------------------------------------------
+
+    if not question:
+
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty"
         )
 
-    chunks = search_documents(
+    # --------------------------------------------------------
+    # VERIFY DOCUMENT
+    # --------------------------------------------------------
+
+    document = db.query(
+        Document
+    ).filter(
+        Document.id == document_id
+    ).first()
+
+    if not document:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Selected document not found"
+        )
+
+    # --------------------------------------------------------
+    # SEARCH ONLY SELECTED DOCUMENT
+    # --------------------------------------------------------
+
+    search_results = search_documents(
         question,
+        document_id=document_id,
         n_results=5
     )
 
-    if not chunks:
+    # --------------------------------------------------------
+    # NO RESULTS
+    # --------------------------------------------------------
+
+    if not search_results:
+
         return {
             "question": question,
+            "document_id": document_id,
+            "document": document.filename,
             "answer": (
-                "No relevant information was "
-                "found in the uploaded documents."
+                "I couldn't find any relevant information "
+                "about this question in the selected document."
             ),
             "sources": []
         }
 
-    context = "\n\n".join(chunks)
+    # --------------------------------------------------------
+    # BUILD CONTEXT
+    # --------------------------------------------------------
 
-    answer = generate_answer(
-        question,
-        context
+    context_parts = []
+
+    sources = []
+
+    for result in search_results:
+
+        context_parts.append(
+            result["document"]
+        )
+
+        sources.append(
+            {
+                "filename": result["filename"],
+                "document_id": int(
+                    result["document_id"]
+                ),
+                "content": result["document"]
+            }
+        )
+
+    context = "\n\n".join(
+        context_parts
     )
+
+    # --------------------------------------------------------
+    # GENERATE AI ANSWER
+    # --------------------------------------------------------
+
+    try:
+
+        answer = generate_answer(
+            question,
+            context
+        )
+
+    except Exception as e:
+
+        print(
+            f"Ollama error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "AI generation failed. "
+                "Make sure Ollama is running "
+                "and the configured model is available."
+            )
+        )
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
 
     return {
         "question": question,
+        "document_id": document_id,
+        "document": document.filename,
         "answer": answer,
-        "sources": chunks
+        "sources": sources
     }
